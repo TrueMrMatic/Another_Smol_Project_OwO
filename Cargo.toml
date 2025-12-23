@@ -6,12 +6,9 @@ edition = "2021"
 [lib]
 crate-type = ["staticlib"]
 
-[profile.release]
-# panic = "abort"
-lto = true
-codegen-units = 1
-opt-level = "s"
-
 [dependencies]
-swf = "0.2.2"
-flate2 = "1.0"
+# We need the core engine. 
+# "guest" feature might be needed depending on build targets, 
+# but start with default or minimal features.
+ruffle_core = { git = "https://github.com/ruffle-rs/ruffle" }
+log = "0.4"
