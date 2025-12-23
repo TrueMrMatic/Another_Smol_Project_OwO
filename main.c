@@ -1,11 +1,32 @@
-// main.c logic loop
-while (aptMainLoop()) {
-    // ... input handling ...
+#include <3ds.h>
+#include <stdio.h>
 
-    // Advance Flash Frame (usually 1000.0 / frame_rate)
-    bridge_tick(player, 1000.0 / 30.0); 
+// Declare Rust functions
+void* bridge_player_create();
+void bridge_tick(void* ctx);
 
-    // Render?
-    // In Phase 1, nothing will show up because we used NullRenderer.
-    // In Phase 2, you will add: bridge_render(player);
+int main(int argc, char* argv[]) {
+    gfxInitDefault();
+    consoleInit(GFX_TOP, NULL); // Print to top screen
+
+    printf("Initializing Ruffle...\n");
+    void* player = bridge_player_create();
+    printf("Ruffle initialized!\n");
+
+    // Main loop
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 kDown = hidKeysDown();
+        if (kDown & KEY_START) break;
+
+        // Tick Ruffle every frame
+        bridge_tick(player);
+
+        gfxFlushBuffers();
+        gfxSwapBuffers();
+        gspWaitForVBlank();
+    }
+
+    gfxExit();
+    return 0;
 }

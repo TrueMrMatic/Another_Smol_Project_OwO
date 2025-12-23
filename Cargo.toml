@@ -7,8 +7,7 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [dependencies]
-# We need the core engine. 
-# "guest" feature might be needed depending on build targets, 
-# but start with default or minimal features.
-ruffle_core = { git = "https://github.com/ruffle-rs/ruffle" }
+# We use the core Ruffle engine
+ruffle_core = { git = "https://github.com/ruffle-rs/ruffle", default-features = false, features = ["avm1"] }
+# "log" allows Ruffle to print messages. We will catch them.
 log = "0.4"
