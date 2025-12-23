@@ -1,7 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::pin::Pin;
 use std::future::Future;
 use std::borrow::Cow;
+use std::task::{Context, Waker, RawWaker, RawWakerVTable};
 
 // --- Imports ---
 use ruffle_core::{Player, PlayerBuilder};
@@ -53,23 +55,56 @@ use url::Url;
 use indexmap::IndexMap;
 use async_channel::{Sender, Receiver};
 
-// --- Embedded "Hello World" SWF ---
+// --- Embedded "Hello World" SWF (Flash 6) ---
 static HELLO_SWF: &[u8] = &[
-    0x46, 0x57, 0x53, 0x08, 0x35, 0x00, 0x00, 0x00, 0x78, 0x00, 0x05, 0x5F,
+    0x46, 0x57, 0x53, 0x06, 0x30, 0x00, 0x00, 0x00, 0x78, 0x00, 0x05, 0x5F,
     0x00, 0x00, 0x0F, 0xA0, 0x00, 0x00, 0x0C, 0x01, 0x00, 0x43, 0x02, 0xFF,
-    0xFF, 0xFF, 0x3F, 0x03, 0x14, 0x00, 0x00, 0x00, 0x96, 0x0D, 0x00, 0x48,
-    0x65, 0x6C, 0x6C, 0x6F, 0x20, 0x33, 0x44, 0x53, 0x00, 0x96, 0x02, 0x00,
-    0x26, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0x10, 0x03, 0x96, 0x0B, 0x00, 0x00, 0x48, 0x65, 0x6C, 0x6C,
+    0x6F, 0x20, 0x33, 0x44, 0x53, 0x00, 0x26, 0x00, 0x40, 0x00, 0x00, 0x00,
 ];
 
-// --- 1. Memory Response for Loading ---
+// --- 1. System Logger ---
+struct ConsoleLogger;
+impl log::Log for ConsoleLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
+    fn log(&self, record: &log::Record) {
+        // Filter out noisy crates, keep AVM logs
+        if record.level() <= log::Level::Info || record.target().contains("avm") {
+            println!("[{}] {}", record.level(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+static LOGGER: ConsoleLogger = ConsoleLogger;
+static INIT_LOGGER: Once = Once::new();
+
+// --- 2. Async Executor ---
+type BoxedFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
+
+unsafe fn dummy_waker_clone(_: *const ()) -> RawWaker { dummy_waker() }
+unsafe fn dummy_waker_wake(_: *const ()) {}
+unsafe fn dummy_waker_wake_by_ref(_: *const ()) {}
+unsafe fn dummy_waker_drop(_: *const ()) {}
+
+const VTABLE: RawWakerVTable = RawWakerVTable::new(
+    dummy_waker_clone,
+    dummy_waker_wake,
+    dummy_waker_wake_by_ref,
+    dummy_waker_drop,
+);
+
+fn dummy_waker() -> RawWaker {
+    RawWaker::new(std::ptr::null(), &VTABLE)
+}
+
+// --- 3. Memory Response ---
 struct MemoryResponse {
     url: String,
     data: Vec<u8>,
 }
 
 impl SuccessResponse for MemoryResponse {
-    fn url(&self) -> Cow<str> { Cow::Borrowed(&self.url) }
+    fn url(&self) -> Cow<'_, str> { Cow::Borrowed(&self.url) }
     fn status(&self) -> u16 { 200 }
     fn redirected(&self) -> bool { false }
 
@@ -78,8 +113,12 @@ impl SuccessResponse for MemoryResponse {
     }
 
     fn body(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DialogLoaderError>>>> {
+        println!("[3DS] body() called for {}", self.url);
         let data = self.data.clone();
-        Box::pin(async move { Ok(data) })
+        Box::pin(async move { 
+            println!("[3DS] Returning {} bytes", data.len());
+            Ok(data) 
+        })
     }
 
     fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, DialogLoaderError>>>> {
@@ -95,9 +134,19 @@ impl SuccessResponse for MemoryResponse {
     }
 }
 
-// --- 2. Unified Backend ---
+// --- 4. Backend ---
 #[derive(Clone)]
-struct ThreeDSBackend;
+struct ThreeDSBackend {
+    tasks: Arc<Mutex<Vec<BoxedFuture>>>,
+}
+
+impl ThreeDSBackend {
+    fn new() -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
 
 // -- Render Backend --
 impl RenderBackend for ThreeDSBackend {
@@ -107,14 +156,13 @@ impl RenderBackend for ThreeDSBackend {
     fn set_viewport_dimensions(&mut self, _dimensions: ViewportDimensions) {}
 
     fn register_shape(&mut self, _shape: DistilledShape<'_>, _bitmap: &dyn BitmapSource) -> ShapeHandle {
-        unimplemented!("Shapes not supported in this stub")
+        println!("[3DS] register_shape called!");
+        unimplemented!("Shapes not supported")
     }
     
     fn submit_frame(&mut self, _clear: Color, _commands: CommandList, _cache: Vec<ruffle_render::backend::BitmapCacheEntry>) {}
 
-    fn render_offscreen(&mut self, _handle: BitmapHandle, _commands: CommandList, _quality: StageQuality, _region: ruffle_render::bitmap::PixelRegion) -> Option<Box<dyn SyncHandle>> {
-        None
-    }
+    fn render_offscreen(&mut self, _handle: BitmapHandle, _commands: CommandList, _quality: StageQuality, _region: ruffle_render::bitmap::PixelRegion) -> Option<Box<dyn SyncHandle>> { None }
 
     fn create_empty_texture(&mut self, _width: u32, _height: u32) -> Result<BitmapHandle, RenderError> {
         Err(RenderError::Unimplemented("stub".into()))
@@ -122,9 +170,7 @@ impl RenderBackend for ThreeDSBackend {
     fn register_bitmap(&mut self, _bitmap: Bitmap) -> Result<BitmapHandle, RenderError> {
         Err(RenderError::Unimplemented("stub".into()))
     }
-    fn update_texture(&mut self, _handle: &BitmapHandle, _bitmap: Bitmap, _region: ruffle_render::bitmap::PixelRegion) -> Result<(), RenderError> {
-        Ok(())
-    }
+    fn update_texture(&mut self, _handle: &BitmapHandle, _bitmap: Bitmap, _region: ruffle_render::bitmap::PixelRegion) -> Result<(), RenderError> { Ok(()) }
     fn create_context3d(&mut self, _profile: Context3DProfile) -> Result<Box<dyn Context3D>, RenderError> {
         Err(RenderError::Unimplemented("stub".into()))
     }
@@ -139,9 +185,7 @@ impl RenderBackend for ThreeDSBackend {
         Err(RenderError::Unimplemented("stub".into()))
     }
     
-    fn resolve_sync_handle(&mut self, _handle: Box<dyn SyncHandle>, _callback: RgbaBufRead) -> Result<(), RenderError> {
-        Ok(())
-    }
+    fn resolve_sync_handle(&mut self, _handle: Box<dyn SyncHandle>, _callback: RgbaBufRead) -> Result<(), RenderError> { Ok(()) }
 }
 
 // -- Audio Backend --
@@ -149,14 +193,11 @@ impl AudioBackend for ThreeDSBackend {
     fn play(&mut self) {}
     fn pause(&mut self) {}
     fn set_volume(&mut self, _volume: f32) {}
-    
-    // FIX: Replaced Err(...) with unimplemented!() to avoid finding enum variants
     fn register_sound(&mut self, _sound: &swf::Sound) -> Result<SoundHandle, RegisterError> { unimplemented!() }
     fn register_mp3(&mut self, _data: &[u8]) -> Result<SoundHandle, DecodeError> { unimplemented!() }
     fn start_sound(&mut self, _sound: SoundHandle, _settings: &SoundInfo) -> Result<SoundInstanceHandle, DecodeError> { unimplemented!() }
     fn start_stream(&mut self, _stream: ruffle_core::tag_utils::SwfSlice, _stream_info: &SoundStreamHead) -> Result<SoundInstanceHandle, DecodeError> { unimplemented!() }
     fn start_substream(&mut self, _substream: Substream, _info: &SoundStreamInfo) -> Result<SoundInstanceHandle, DecodeError> { unimplemented!() }
-    
     fn stop_sound(&mut self, _sound: SoundInstanceHandle) {}
     fn stop_all_sounds(&mut self) {}
     fn get_sound_position(&self, _sound: SoundInstanceHandle) -> Option<f64> { None }
@@ -175,6 +216,8 @@ impl NavigatorBackend for ThreeDSBackend {
     
     fn fetch(&self, request: Request) -> Pin<Box<dyn Future<Output = Result<Box<dyn SuccessResponse>, ErrorResponse>>>> {
         let url = request.url().to_string();
+        println!("[3DS] Fetching URL: {}", url);
+
         if url.contains("test.swf") {
             let response = MemoryResponse {
                 url: url,
@@ -185,7 +228,6 @@ impl NavigatorBackend for ThreeDSBackend {
              Box::pin(async move { 
                  Err(ErrorResponse {
                      url: url,
-                     // We use .into() to convert the std::io::Error to the type Ruffle expects
                      error: std::io::Error::new(std::io::ErrorKind::NotFound, "Not found").into()
                  }) 
              })
@@ -193,7 +235,18 @@ impl NavigatorBackend for ThreeDSBackend {
     }
 
     fn resolve_url(&self, url: &str) -> Result<Url, url::ParseError> { Url::parse(url) }
-    fn spawn_future(&mut self, _future: Pin<Box<dyn Future<Output = Result<(), DialogLoaderError>>>>) {}
+
+    fn spawn_future(&mut self, future: Pin<Box<dyn Future<Output = Result<(), DialogLoaderError>>>>) {
+        // println!("[3DS] Spawning background task...");
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.push(Box::pin(async move { 
+            match future.await {
+                Ok(_) => println!("[3DS] Task finished: Ok"),
+                Err(e) => println!("[3DS] Task finished: Error {:?}", e),
+            }
+        }));
+    }
+
     fn pre_process_url(&self, url: Url) -> Url { url }
     fn connect_socket(&mut self, _host: String, _port: u16, _timeout: std::time::Duration, _handle: SocketHandle, _receiver: Receiver<Vec<u8>>, _sender: Sender<SocketAction>) {}
 }
@@ -242,17 +295,23 @@ impl VideoBackend for ThreeDSBackend {
 
 pub struct BridgeContext {
     player: Arc<Mutex<Player>>,
+    backend: ThreeDSBackend,
 }
 
 #[no_mangle]
 pub extern "C" fn bridge_player_create() -> *mut BridgeContext {
-    let backend = ThreeDSBackend;
+    INIT_LOGGER.call_once(|| {
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+    });
+
+    let backend = ThreeDSBackend::new();
 
     let player = PlayerBuilder::new()
         .with_renderer(backend.clone())
         .with_audio(backend.clone())
         .with_navigator(backend.clone())
-        .with_storage(Box::new(backend.clone())) 
+        .with_storage(Box::new(backend.clone()))
         .with_video(backend.clone())
         .with_log(backend.clone())
         .with_ui(backend.clone())
@@ -260,20 +319,46 @@ pub extern "C" fn bridge_player_create() -> *mut BridgeContext {
 
     let player_arc = player;
 
-    // Trigger Load
+    println!("[3DS] Requesting Movie Load...");
     {
         let mut p = player_arc.lock().unwrap();
-        // This triggers NavigatorBackend::fetch("test.swf")
-        p.fetch_root_movie("test.swf".to_string(), vec![], Box::new(|_| {}));
+        p.fetch_root_movie("test.swf".to_string(), vec![], Box::new(|_| {
+            println!("[3DS] Root movie fetched callback!");
+        }));
     }
 
-    Box::into_raw(Box::new(BridgeContext { player: player_arc }))
+    Box::into_raw(Box::new(BridgeContext { 
+        player: player_arc,
+        backend: backend,
+    }))
 }
+
+// Use AtomicU32 for safe global counter
+static TICK_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 #[no_mangle]
 pub extern "C" fn bridge_tick(ctx: *mut BridgeContext) {
     if ctx.is_null() { return; }
     let ctx = unsafe { &*ctx };
+    
+    // 1. Run Async Tasks
+    {
+        let mut tasks = ctx.backend.tasks.lock().unwrap();
+        let waker = unsafe { Waker::from_raw(dummy_waker()) };
+        let mut context = Context::from_waker(&waker);
+
+        tasks.retain_mut(|task| {
+            task.as_mut().poll(&mut context).is_pending()
+        });
+    }
+
+    // 2. Tick Ruffle
     let mut player = ctx.player.lock().unwrap();
     player.tick(33.33); 
+
+    // 3. Heartbeat
+    let ticks = TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if ticks % 60 == 0 {
+        println!("[3DS] Tick {}", ticks);
+    }
 }
