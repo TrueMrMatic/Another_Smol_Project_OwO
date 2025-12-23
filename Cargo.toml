@@ -7,7 +7,14 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [dependencies]
-# We use the core Ruffle engine
-ruffle_core = { git = "https://github.com/ruffle-rs/ruffle", default-features = false, features = ["avm1"] }
-# "log" allows Ruffle to print messages. We will catch them.
+# Ruffle crates
+ruffle_core = { git = "https://github.com/ruffle-rs/ruffle", default-features = false }
+ruffle_render = { git = "https://github.com/ruffle-rs/ruffle" }
+ruffle_video = { git = "https://github.com/ruffle-rs/ruffle" }
+
+# Dependencies for the Backend
+url = "2.5"
+indexmap = "2.2"
+async-channel = "2.3"
 log = "0.4"
+encoding_rs = "0.8" # New dependency

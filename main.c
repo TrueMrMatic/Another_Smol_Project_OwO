@@ -30,3 +30,17 @@ int main(int argc, char* argv[]) {
     gfxExit();
     return 0;
 }
+
+#include <sys/types.h>
+#include <stdlib.h>
+#include <time.h>
+
+// Rust requires this for HashMap initialization.
+// On a real app, use the 3DS secure RNG (sslc), but this is enough to link.
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
+    char *p = (char *)buf;
+    for (size_t i = 0; i < buflen; i++) {
+        p[i] = rand() % 256;
+    }
+    return buflen;
+}

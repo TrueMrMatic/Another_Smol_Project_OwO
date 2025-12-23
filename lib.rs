@@ -1,19 +1,59 @@
 use std::sync::{Arc, Mutex};
-use std::ffi::c_void;
-use ruffle_core::backend::{
-    audio::NullAudioBackend,
-    navigator::NullNavigatorBackend,
-    storage::MemoryStorageBackend,
-    ui::NullUiBackend,
-    video::NullVideoBackend,
-    render::NullRenderer,
-    log::LogBackend,
-};
-use ruffle_core::Player;
+use std::pin::Pin;
+use std::future::Future;
+use std::borrow::Cow;
 
-// --- 1. The Embedded "Hello World" SWF ---
-// This acts as a "cartridge" hardcoded in your app for testing.
-// It simply prints "Hello 3DS" to the log.
+// --- Imports ---
+use ruffle_core::{Player, PlayerBuilder};
+use ruffle_core::swf::{self, SoundInfo, SoundStreamHead, SoundFormat};
+use ruffle_core::socket::{SocketHandle, SocketAction};
+use ruffle_core::Color;
+
+// Render
+use ruffle_render::backend::{
+    RenderBackend, ViewportDimensions, Context3D, Context3DProfile,
+    ShapeHandle, PixelBenderOutput, PixelBenderTarget
+};
+use ruffle_render::bitmap::{Bitmap, BitmapHandle, BitmapInfo, SyncHandle, BitmapSource, RgbaBufRead};
+use ruffle_render::commands::CommandList;
+use ruffle_render::error::Error as RenderError;
+use ruffle_render::quality::StageQuality;
+use ruffle_render::shape_utils::DistilledShape;
+use ruffle_render::pixel_bender::{PixelBenderShader, PixelBenderShaderHandle};
+use ruffle_render::pixel_bender_support::PixelBenderShaderArgument;
+
+// Audio
+use ruffle_core::backend::audio::{
+    AudioBackend, SoundHandle, SoundInstanceHandle, SoundTransform, 
+    RegisterError, SoundStreamInfo, Substream, DecodeError
+};
+
+// Navigator
+use ruffle_core::backend::navigator::{
+    NavigatorBackend, NavigationMethod, Request, SuccessResponse, ErrorResponse
+};
+use ruffle_core::backend::ui::DialogLoaderError;
+
+// UI, Storage, Log
+use ruffle_core::backend::storage::StorageBackend;
+use ruffle_core::backend::ui::{
+    UiBackend, MouseCursor, FileFilter, FileDialogResult, 
+    FontDefinition, LanguageIdentifier
+};
+use ruffle_core::font::FontQuery; 
+use ruffle_core::backend::log::LogBackend;
+
+// Video
+use ruffle_video::backend::VideoBackend;
+use ruffle_video::VideoStreamHandle; 
+use ruffle_video::error::Error as VideoError;
+
+// External
+use url::Url;
+use indexmap::IndexMap;
+use async_channel::{Sender, Receiver};
+
+// --- Embedded "Hello World" SWF ---
 static HELLO_SWF: &[u8] = &[
     0x46, 0x57, 0x53, 0x08, 0x35, 0x00, 0x00, 0x00, 0x78, 0x00, 0x05, 0x5F,
     0x00, 0x00, 0x0F, 0xA0, 0x00, 0x00, 0x0C, 0x01, 0x00, 0x43, 0x02, 0xFF,
@@ -22,18 +62,182 @@ static HELLO_SWF: &[u8] = &[
     0x26, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
 ];
 
-// --- 2. Custom Logger for 3DS ---
-// This intercepts Ruffle logs and prints them to the 3DS stdout (your console).
-struct ThreeDSLogger;
-impl LogBackend for ThreeDSLogger {
-    fn avm_trace(&self, message: &str) {
-        // This handles "trace(...)" calls from ActionScript
-        println!("[AVM] {}", message);
+// --- 1. Memory Response for Loading ---
+struct MemoryResponse {
+    url: String,
+    data: Vec<u8>,
+}
+
+impl SuccessResponse for MemoryResponse {
+    fn url(&self) -> Cow<str> { Cow::Borrowed(&self.url) }
+    fn status(&self) -> u16 { 200 }
+    fn redirected(&self) -> bool { false }
+
+    fn expected_length(&self) -> Result<Option<u64>, DialogLoaderError> {
+        Ok(Some(self.data.len() as u64))
     }
-    fn log(&self, text: &str, level: log::Level) {
-        // This handles internal Ruffle engine logs
-        println!("[Ruffle:{}] {}", level, text);
+
+    fn body(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, DialogLoaderError>>>> {
+        let data = self.data.clone();
+        Box::pin(async move { Ok(data) })
     }
+
+    fn next_chunk(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, DialogLoaderError>>>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn text_encoding(&self) -> Option<&'static encoding_rs::Encoding> {
+        None
+    }
+    
+    fn set_url(&mut self, url: String) {
+        self.url = url;
+    }
+}
+
+// --- 2. Unified Backend ---
+#[derive(Clone)]
+struct ThreeDSBackend;
+
+// -- Render Backend --
+impl RenderBackend for ThreeDSBackend {
+    fn viewport_dimensions(&self) -> ViewportDimensions {
+        ViewportDimensions { width: 400, height: 240, scale_factor: 1.0 }
+    }
+    fn set_viewport_dimensions(&mut self, _dimensions: ViewportDimensions) {}
+
+    fn register_shape(&mut self, _shape: DistilledShape<'_>, _bitmap: &dyn BitmapSource) -> ShapeHandle {
+        unimplemented!("Shapes not supported in this stub")
+    }
+    
+    fn submit_frame(&mut self, _clear: Color, _commands: CommandList, _cache: Vec<ruffle_render::backend::BitmapCacheEntry>) {}
+
+    fn render_offscreen(&mut self, _handle: BitmapHandle, _commands: CommandList, _quality: StageQuality, _region: ruffle_render::bitmap::PixelRegion) -> Option<Box<dyn SyncHandle>> {
+        None
+    }
+
+    fn create_empty_texture(&mut self, _width: u32, _height: u32) -> Result<BitmapHandle, RenderError> {
+        Err(RenderError::Unimplemented("stub".into()))
+    }
+    fn register_bitmap(&mut self, _bitmap: Bitmap) -> Result<BitmapHandle, RenderError> {
+        Err(RenderError::Unimplemented("stub".into()))
+    }
+    fn update_texture(&mut self, _handle: &BitmapHandle, _bitmap: Bitmap, _region: ruffle_render::bitmap::PixelRegion) -> Result<(), RenderError> {
+        Ok(())
+    }
+    fn create_context3d(&mut self, _profile: Context3DProfile) -> Result<Box<dyn Context3D>, RenderError> {
+        Err(RenderError::Unimplemented("stub".into()))
+    }
+    fn debug_info(&self) -> Cow<'static, str> { Cow::Borrowed("3DS") }
+    fn name(&self) -> &'static str { "3DS" }
+    fn set_quality(&mut self, _quality: StageQuality) {}
+
+    fn compile_pixelbender_shader(&mut self, _shader: PixelBenderShader) -> Result<PixelBenderShaderHandle, RenderError> {
+        Err(RenderError::Unimplemented("stub".into()))
+    }
+    fn run_pixelbender_shader(&mut self, _handle: PixelBenderShaderHandle, _args: &[PixelBenderShaderArgument], _target: &PixelBenderTarget) -> Result<PixelBenderOutput, RenderError> {
+        Err(RenderError::Unimplemented("stub".into()))
+    }
+    
+    fn resolve_sync_handle(&mut self, _handle: Box<dyn SyncHandle>, _callback: RgbaBufRead) -> Result<(), RenderError> {
+        Ok(())
+    }
+}
+
+// -- Audio Backend --
+impl AudioBackend for ThreeDSBackend {
+    fn play(&mut self) {}
+    fn pause(&mut self) {}
+    fn set_volume(&mut self, _volume: f32) {}
+    
+    // FIX: Replaced Err(...) with unimplemented!() to avoid finding enum variants
+    fn register_sound(&mut self, _sound: &swf::Sound) -> Result<SoundHandle, RegisterError> { unimplemented!() }
+    fn register_mp3(&mut self, _data: &[u8]) -> Result<SoundHandle, DecodeError> { unimplemented!() }
+    fn start_sound(&mut self, _sound: SoundHandle, _settings: &SoundInfo) -> Result<SoundInstanceHandle, DecodeError> { unimplemented!() }
+    fn start_stream(&mut self, _stream: ruffle_core::tag_utils::SwfSlice, _stream_info: &SoundStreamHead) -> Result<SoundInstanceHandle, DecodeError> { unimplemented!() }
+    fn start_substream(&mut self, _substream: Substream, _info: &SoundStreamInfo) -> Result<SoundInstanceHandle, DecodeError> { unimplemented!() }
+    
+    fn stop_sound(&mut self, _sound: SoundInstanceHandle) {}
+    fn stop_all_sounds(&mut self) {}
+    fn get_sound_position(&self, _sound: SoundInstanceHandle) -> Option<f64> { None }
+    fn get_sound_duration(&self, _sound: SoundHandle) -> Option<f64> { None }
+    fn get_sound_size(&self, _sound: SoundHandle) -> Option<u32> { None }
+    fn get_sound_format(&self, _sound: SoundHandle) -> Option<&SoundFormat> { None }
+    fn set_sound_transform(&mut self, _sound: SoundInstanceHandle, _transform: SoundTransform) {}
+    fn get_sound_peak(&mut self, _sound: SoundInstanceHandle) -> Option<[f32; 2]> { None }
+    fn volume(&self) -> f32 { 1.0 }
+    fn get_sample_history(&self) -> [[f32; 2]; 1024] { [[0.0; 2]; 1024] }
+}
+
+// -- Navigator Backend --
+impl NavigatorBackend for ThreeDSBackend {
+    fn navigate_to_url(&self, _url: &str, _target: &str, _vars: Option<(NavigationMethod, IndexMap<String, String>)>) {}
+    
+    fn fetch(&self, request: Request) -> Pin<Box<dyn Future<Output = Result<Box<dyn SuccessResponse>, ErrorResponse>>>> {
+        let url = request.url().to_string();
+        if url.contains("test.swf") {
+            let response = MemoryResponse {
+                url: url,
+                data: HELLO_SWF.to_vec(),
+            };
+            Box::pin(async move { Ok(Box::new(response) as Box<dyn SuccessResponse>) })
+        } else {
+             Box::pin(async move { 
+                 Err(ErrorResponse {
+                     url: url,
+                     // We use .into() to convert the std::io::Error to the type Ruffle expects
+                     error: std::io::Error::new(std::io::ErrorKind::NotFound, "Not found").into()
+                 }) 
+             })
+        }
+    }
+
+    fn resolve_url(&self, url: &str) -> Result<Url, url::ParseError> { Url::parse(url) }
+    fn spawn_future(&mut self, _future: Pin<Box<dyn Future<Output = Result<(), DialogLoaderError>>>>) {}
+    fn pre_process_url(&self, url: Url) -> Url { url }
+    fn connect_socket(&mut self, _host: String, _port: u16, _timeout: std::time::Duration, _handle: SocketHandle, _receiver: Receiver<Vec<u8>>, _sender: Sender<SocketAction>) {}
+}
+
+// -- Storage Backend --
+impl StorageBackend for ThreeDSBackend {
+    fn get(&self, _key: &str) -> Option<Vec<u8>> { None }
+    fn put(&mut self, _key: &str, _value: &[u8]) -> bool { false }
+    fn remove_key(&mut self, _key: &str) {}
+}
+
+// -- UI Backend --
+impl UiBackend for ThreeDSBackend {
+    fn mouse_visible(&self) -> bool { true }
+    fn set_mouse_visible(&mut self, _visible: bool) {}
+    fn set_mouse_cursor(&mut self, _cursor: MouseCursor) {}
+    fn clipboard_content(&mut self) -> String { String::new() }
+    fn set_clipboard_content(&mut self, _content: String) {}
+    fn set_fullscreen(&mut self, _is_full: bool) -> Result<(), Cow<'static, str>> { Ok(()) }
+    fn display_root_movie_download_failed_message(&self, _unknown: bool, _msg: String) {}
+    fn message(&self, _message: &str) {}
+    fn open_virtual_keyboard(&self) {}
+    fn close_virtual_keyboard(&self) {}
+    fn language(&self) -> LanguageIdentifier { "en-US".parse().unwrap() }
+    fn display_unsupported_video(&self, _url: Url) {}
+    fn load_device_font(&self, _query: &FontQuery, _callback: &mut dyn FnMut(FontDefinition)) {}
+    fn sort_device_fonts(&self, _query: &FontQuery, _callback: &mut dyn FnMut(FontDefinition)) -> Vec<FontQuery> { vec![] }
+    fn display_file_open_dialog(&mut self, _filter: Vec<FileFilter>) -> Option<Pin<Box<dyn Future<Output = Result<Box<dyn FileDialogResult>, DialogLoaderError>>>>> { None }
+    fn display_file_save_dialog(&mut self, _title: String, _filter: String) -> Option<Pin<Box<dyn Future<Output = Result<Box<dyn FileDialogResult>, DialogLoaderError>>>>> { None }
+    fn close_file_dialog(&mut self) {}
+}
+
+// -- Log Backend --
+impl LogBackend for ThreeDSBackend {
+    fn avm_trace(&self, message: &str) { println!("[AVM] {}", message); }
+    fn avm_warning(&self, message: &str) { println!("[AVM Warn] {}", message); }
+}
+
+// -- Video Backend --
+impl VideoBackend for ThreeDSBackend {
+    fn register_video_stream(&mut self, _num_frames: u32, _size: (u16, u16), _codec: swf::VideoCodec, _deblocking: swf::VideoDeblocking) -> Result<VideoStreamHandle, VideoError> { unimplemented!() }
+    fn configure_video_stream_decoder(&mut self, _handle: VideoStreamHandle, _header: &[u8]) -> Result<(), VideoError> { unimplemented!() }
+    fn preload_video_stream_frame(&mut self, _handle: VideoStreamHandle, _frame: ruffle_video::frame::EncodedFrame<'_>) -> Result<ruffle_video::frame::FrameDependency, VideoError> { unimplemented!() }
+    fn decode_video_stream_frame(&mut self, _handle: VideoStreamHandle, _frame: ruffle_video::frame::EncodedFrame<'_>, _renderer: &mut dyn RenderBackend) -> Result<BitmapInfo, VideoError> { unimplemented!() }
 }
 
 pub struct BridgeContext {
@@ -42,40 +246,25 @@ pub struct BridgeContext {
 
 #[no_mangle]
 pub extern "C" fn bridge_player_create() -> *mut BridgeContext {
-    // A. Setup Backends
-    let renderer = Box::new(NullRenderer::new());
-    let audio = Box::new(NullAudioBackend::new());
-    let navigator = Box::new(NullNavigatorBackend::new());
-    let storage = Box::new(MemoryStorageBackend::default());
-    let video = Box::new(NullVideoBackend::new());
-    let ui = Box::new(NullUiBackend::new());
-    
-    // Use our custom logger!
-    let log = Box::new(ThreeDSLogger);
+    let backend = ThreeDSBackend;
 
-    // B. Build Player
-    let player = Player::builder()
-        .with_renderer(renderer)
-        .with_audio(audio)
-        .with_navigator(navigator)
-        .with_storage(storage)
-        .with_video(video)
-        .with_log(log)
-        .with_ui(ui)
+    let player = PlayerBuilder::new()
+        .with_renderer(backend.clone())
+        .with_audio(backend.clone())
+        .with_navigator(backend.clone())
+        .with_storage(Box::new(backend.clone())) 
+        .with_video(backend.clone())
+        .with_log(backend.clone())
+        .with_ui(backend.clone())
         .build();
 
-    let player_arc = Arc::new(Mutex::new(player));
+    let player_arc = player;
 
-    // C. Load our hardcoded Hello World SWF
+    // Trigger Load
     {
         let mut p = player_arc.lock().unwrap();
-        let movie = ruffle_core::tag_utils::SwfMovie::from_data(
-            HELLO_SWF.to_vec(), 
-            None, 
-            None
-        ).expect("Failed to load embedded SWF");
-        
-        p.fetch_root_movie(movie);
+        // This triggers NavigatorBackend::fetch("test.swf")
+        p.fetch_root_movie("test.swf".to_string(), vec![], Box::new(|_| {}));
     }
 
     Box::into_raw(Box::new(BridgeContext { player: player_arc }))
@@ -86,6 +275,5 @@ pub extern "C" fn bridge_tick(ctx: *mut BridgeContext) {
     if ctx.is_null() { return; }
     let ctx = unsafe { &*ctx };
     let mut player = ctx.player.lock().unwrap();
-    // Run the engine for 1 frame (approx 33ms)
     player.tick(33.33); 
 }
