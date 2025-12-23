@@ -1,0 +1,17 @@
+[package]
+name = "bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+# panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "s"
+
+[dependencies]
+swf = "0.2.2"
+flate2 = "1.0"
